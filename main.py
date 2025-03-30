@@ -1,254 +1,229 @@
-# main.py
 import os
 from typing import List, Dict, Any, Optional
-import numpy as np
-from pathlib import Path
-import json
 from datetime import datetime
-import faiss
-import uuid
-from dotenv import load_dotenv
-from pydantic import BaseModel
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.llms import OpenAI
-from langchain.vectorstores import FAISS
-from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent
-from langchain.schema import Document
+import time
+import json
 import requests
+import weaviate
+from weaviate.embedded import EmbeddedOptions
+from bs4 import BeautifulSoup
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_openai import ChatOpenAI
+from langchain_deepseek import ChatDeepSeek
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain.tools.render import render_text_description
+from langchain_core.tools import Tool
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolExecutor, ToolInvocation
 
-# Load environment variables
-load_dotenv()
+# Configure environment - you should set these in your environment
+# os.environ["OPENAI_API_KEY"] = "your-openai-api-key"
+# os.environ["DEEPSEEK_API_KEY"] = "your-deepseek-api-key"
 
-# Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-VECTOR_DB_PATH = "./data/vector_store"
-PAPERS_PATH = "./data/papers"
 
-# Setup directories
-Path(VECTOR_DB_PATH).mkdir(exist_ok=True, parents=True)
-Path(PAPERS_PATH).mkdir(exist_ok=True, parents=True)
+# Create a judge for evaluation (using GPT-4o)
+judge_llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
-# Data models
-class Author(BaseModel):
-    name: str
-    affiliation: Optional[str] = None
 
-class Paper(BaseModel):
-    id: str
-    title: str
-    abstract: str
-    authors: List[Author]
-    full_text: Optional[str] = None
-    pdf_url: Optional[str] = None
-    embedding_id: Optional[str] = None
+# Define Manager Agent prompt
+manager_agent_prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content="""You are a Manager Agent overseeing a collaborative research system. Your job is to:
+1. Analyze the user's query
+2. Decide which agent should handle it:
+   - Search Agent: For finding and adding new research papers
+   - RAG Agent: For answering questions based on papers in the database
+3. Coordinate their activities
+4. Synthesize their outputs into a final answer for the user
+
+Use the tools available to you and think step by step."""),
+    MessagesPlaceholder(variable_name="messages"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+# Define evaluation prompt
+evaluation_prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content="""You are an expert evaluator tasked with judging the quality of responses to research questions. 
     
-    @classmethod
-    def create(cls, title, abstract, authors, **kwargs):
-        return cls(
-            id=str(uuid.uuid4()),
-            title=title,
-            abstract=abstract,
-            authors=[Author(**a) if isinstance(a, dict) else a for a in authors],
-            **kwargs
-        )
+Score each response on a scale of 1-10 based on:
+1. Accuracy: How factually correct is the information?
+2. Relevance: How well does it address the specific question asked?
+3. Comprehensiveness: How complete is the coverage of relevant aspects?
+4. Evidence: How well supported are the claims with references?
+5. Clarity: How clearly is the information presented?
 
-# Database Manager
-class DatabaseManager:
-    def __init__(self):
-        self.embeddings = OpenAIEmbeddings()
-        self.vector_store = None
-        self.load_vector_store()
+Provide your overall score and brief justification."""),
+    HumanMessage(content="""
+Question: {query}
+
+Response to evaluate: {response}
+
+Please evaluate this response.
+""")
+])
+
+# Function to create a ReAct-style agent
+def create_react_agent(llm, prompt):
+    def format_tool_to_tool_schema(tool):
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.args_schema.schema() if hasattr(tool, "args_schema") else {"type": "object", "properties": {}},
+            },
+        }
+
+    # Format the tools for the LLM
+    llm_with_tools = llm.bind_tools(tools, format_tool_to_tool_schema=format_tool_to_tool_schema)
     
-    def load_vector_store(self):
-        try:
-            self.vector_store = FAISS.load_local(VECTOR_DB_PATH, self.embeddings)
-            print("Vector store loaded successfully")
-        except:
-            self.vector_store = FAISS.from_texts(["Initialization text"], self.embeddings)
-            self.vector_store.save_local(VECTOR_DB_PATH)
-            print("New vector store initialized")
-    
-    def add_paper(self, paper: Paper):
-        # Save paper to disk
-        paper_path = Path(PAPERS_PATH) / f"{paper.id}.json"
-        with open(paper_path, 'w') as f:
-            f.write(paper.json())
+    # Logic for handling the agent's decision making
+    def agent_step(state):
+        input_messages = state["messages"]
         
-        # Add to vector store
-        doc = Document(
-            page_content=f"{paper.title}\n{paper.abstract}",
-            metadata={"paper_id": paper.id}
-        )
-        self.vector_store.add_documents([doc])
-        self.vector_store.save_local(VECTOR_DB_PATH)
-        return paper.id
-    
-    def search_papers(self, query: str, k: int = 5):
-        docs = self.vector_store.similarity_search(query, k=k)
-        results = []
-        for doc in docs:
-            paper_id = doc.metadata.get("paper_id")
-            if paper_id:
-                paper = self.get_paper(paper_id)
-                if paper:
-                    results.append((paper, doc.metadata.get("score", 0.0)))
-        return results
-    
-    def get_paper(self, paper_id: str) -> Optional[Paper]:
-        paper_path = Path(PAPERS_PATH) / f"{paper_id}.json"
-        if paper_path.exists():
-            with open(paper_path, 'r') as f:
-                return Paper.parse_raw(f.read())
-        return None
-
-# Search Agent
-class SearchAgent:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db_manager = db_manager
-    
-    def search_arxiv(self, query: str, max_results: int = 5):
-        # Simple ArXiv API implementation
-        base_url = "http://export.arxiv.org/api/query?"
-        search_query = f"search_query=all:{query.replace(' ', '+')}&start=0&max_results={max_results}"
-        response = requests.get(base_url + search_query)
+        # Get the most recent message
+        most_recent_message = input_messages[-1]
         
-        # Basic parsing (in production, use a proper XML parser)
-        import re
-        papers = []
-        entries = re.findall(r'<entry>(.*?)</entry>', response.text, re.DOTALL)
+        # If it's already an AI message, we've completed a step
+        if isinstance(most_recent_message, AIMessage):
+            return {"messages": input_messages}
         
-        for entry in entries:
-            title_match = re.search(r'<title>(.*?)</title>', entry, re.DOTALL)
-            abstract_match = re.search(r'<summary>(.*?)</summary>', entry, re.DOTALL)
-            author_matches = re.findall(r'<author>(.*?)</author>', entry, re.DOTALL)
+        # Initialize or get agent_scratchpad
+        agent_scratchpad = []
+        if "agent_scratchpad" in state:
+            agent_scratchpad = state["agent_scratchpad"]
+        
+        # Prompt the LLM
+        output = llm_with_tools.invoke({
+            "messages": input_messages,
+            "agent_scratchpad": agent_scratchpad,
+        })
+        
+        # Check if the LLM wants to use a tool
+        if "function_call" in output.additional_kwargs:
+            tool_call = output.additional_kwargs["function_call"]
             
-            if title_match and abstract_match:
-                title = title_match.group(1).strip()
-                abstract = abstract_match.group(1).strip()
-                
-                authors = []
-                for author_text in author_matches:
-                    name_match = re.search(r'<name>(.*?)</name>', author_text)
-                    if name_match:
-                        authors.append(Author(name=name_match.group(1).strip()))
-                
-                paper = Paper.create(
-                    title=title,
-                    abstract=abstract,
-                    authors=authors
+            # Add the agent's thinking to scratchpad
+            agent_scratchpad.append(output)
+            
+            # Extract tool name and args
+            tool_name = tool_call["name"]
+            tool_input = json.loads(tool_call["arguments"])
+            
+            # Execute the tool
+            tool_result = tool_executor.invoke(
+                ToolInvocation(
+                    tool=tool_name,
+                    tool_input=tool_input,
                 )
-                
-                # Add to database
-                self.db_manager.add_paper(paper)
-                papers.append(paper)
-        
-        return papers
+            )
+            
+            # Format the result and add to scratchpad
+            observation_msg = AIMessage(content=str(tool_result))
+            agent_scratchpad.append(observation_msg)
+            
+            # Return the updated state with agent_scratchpad
+            return {"messages": input_messages, "agent_scratchpad": agent_scratchpad}
+        else:
+            # Agent is done - return final answer message
+            return {"messages": input_messages + [output]}
     
-    def execute_search(self, query: str):
-        # First check if we already have relevant papers
-        existing_results = self.db_manager.search_papers(query, k=3)
-        
-        # If we have enough results, return them
-        if len(existing_results) >= 3:
-            return [paper for paper, _ in existing_results]
-        
-        # Otherwise, search for new papers
-        new_papers = self.search_arxiv(query)
-        return new_papers
+    # Build the workflow graph
+    workflow = StateGraph(state_types={"messages": List, "agent_scratchpad": List})
+    
+    # Add the main agent node
+    workflow.add_node("agent", agent_step)
+    
+    # Define the entry and exit
+    workflow.set_entry_point("agent")
+    workflow.add_conditional_edges(
+        "agent",
+        lambda state: "agent" if "agent_scratchpad" in state else END,
+    )
+    
+    # Compile the workflow
+    return workflow.compile()
 
-# RAG Agent
-class RAGAgent:
-    def __init__(self, db_manager: DatabaseManager, search_agent: SearchAgent):
-        self.db_manager = db_manager
-        self.search_agent = search_agent
-        self.openai_model = OpenAI(temperature=0)
-    
-    def answer_query(self, query: str):
-        # First try to find relevant papers in our database
-        papers = self.db_manager.search_papers(query, k=3)
-        
-        # If not enough papers found, search for more
-        if len(papers) < 2:
-            new_papers = self.search_agent.execute_search(query)
-            # Get the papers again after adding new ones
-            papers = self.db_manager.search_papers(query, k=3)
-        
-        # Prepare context from papers
-        context = ""
-        for paper, _ in papers:
-            context += f"Title: {paper.title}\nAbstract: {paper.abstract}\n\n"
-        
-        # Generate answer with OpenAI
-        prompt = f"""
-        Based on the following research papers, please answer the query: "{query}"
-        
-        {context}
-        
-        Provide a comprehensive answer with reasoning based only on the information in these papers.
-        """
-        
-        return self.openai_model.predict(prompt)
+# Create the agents
+search_agent = create_react_agent(openai_o1, search_agent_prompt)
+rag_agent_openai = create_react_agent(openai_o1, rag_agent_prompt)
+rag_agent_deepseek = create_react_agent(deepseek_r1, rag_agent_prompt)
+manager_agent = create_react_agent(openai_o1, manager_agent_prompt)
 
-# Evaluation Agent
-class EvaluationAgent:
-    def __init__(self):
-        self.openai_model = OpenAI(temperature=0)
-    
-    def evaluate_response(self, query: str, response: str, papers: List[Paper]):
-        # Prepare context from papers
-        context = ""
-        for paper in papers:
-            context += f"Title: {paper.title}\nAbstract: {paper.abstract}\n\n"
-        
-        # Create evaluation prompt
-        eval_prompt = f"""
-        You are an evaluation agent assessing the quality of an AI response to a research query.
-        
-        Query: "{query}"
-        
-        Response to evaluate:
-        {response}
-        
-        The response was generated based on these research papers:
-        {context}
-        
-        Please evaluate the response on a scale of 1-10 for the following criteria:
-        1. Relevance to the query
-        2. Accuracy of information
-        3. Reasoning quality
-        4. Completeness
-        
-        Provide a brief justification for each score and an overall assessment.
-        """
-        
-        return self.openai_model.predict(eval_prompt)
+def evaluate_response(query, response):
+    """Evaluate a response using the judge LLM"""
+    evaluation = judge_llm.invoke(
+        evaluation_prompt.format(
+            query=query,
+            response=response
+        )
+    )
+    return evaluation.content
 
-# Main application
-def main():
-    print("Initializing MARA - Multi-Agent Research Assistant")
+# Main interaction function
+def process_query(query, model="openai"):
+    """Process a research query through the agent system"""
+    # Start with the manager agent
+    manager_result = manager_agent.invoke({"messages": [HumanMessage(content=f"Research query: {query}")]})
+    manager_response = manager_result["messages"][-1].content
     
-    # Initialize components
-    db_manager = DatabaseManager()
-    search_agent = SearchAgent(db_manager)
-    rag_agent = RAGAgent(db_manager, search_agent)
-    evaluation_agent = EvaluationAgent()
+    # Check if the manager determined we need to search for new papers
+    if "search_agent" in manager_response.lower():
+        search_result = search_agent.invoke({"messages": [HumanMessage(content=f"Find papers for: {query}")]})
+        search_response = search_result["messages"][-1].content
+        print(f"Search Agent: {search_response}")
     
-    # Example usage
-    query = "What are the latest advances in transformer architectures for NLP?"
+    # Use the appropriate RAG agent based on model parameter
+    if model.lower() == "openai":
+        rag_agent = rag_agent_openai
+        model_name = "OpenAI o1"
+    else:
+        rag_agent = rag_agent_deepseek
+        model_name = "DeepSeek R1"
     
-    print(f"Processing query: {query}")
-    answer = rag_agent.answer_query(query)
+    # Get the answer from the RAG agent
+    rag_result = rag_agent.invoke({"messages": [HumanMessage(content=query)]})
+    rag_response = rag_result["messages"][-1].content
     
-    print("\nAnswer:")
-    print(answer)
+    # Evaluate the response
+    evaluation = evaluate_response(query, rag_response)
     
-    # Get papers for evaluation
-    papers = [paper for paper, _ in db_manager.search_papers(query)]
-    evaluation = evaluation_agent.evaluate_response(query, answer, papers)
-    
-    print("\nEvaluation:")
-    print(evaluation)
+    return {
+        "query": query,
+        "model": model_name,
+        "response": rag_response,
+        "evaluation": evaluation
+    }
 
+# Compare both models
+def compare_models(query):
+    """Compare OpenAI o1 and DeepSeek R1 on the same query"""
+    print(f"Processing query with OpenAI o1...")
+    openai_result = process_query(query, "openai")
+    
+    print(f"Processing query with DeepSeek R1...")
+    deepseek_result = process_query(query, "deepseek")
+    
+    return {
+        "query": query,
+        "openai_result": openai_result,
+        "deepseek_result": deepseek_result
+    }
+
+# Example usage
 if __name__ == "__main__":
-    main()
+    query = "What are the latest developments in large language model reasoning capabilities?"
+    results = compare_models(query)
+    
+    print("\n=== Results ===")
+    print(f"Query: {results['query']}")
+    print("\nOpenAI o1 Response:")
+    print(results['openai_result']['response'])
+    print("\nOpenAI o1 Evaluation:")
+    print(results['openai_result']['evaluation'])
+    print("\nDeepSeek R1 Response:")
+    print(results['deepseek_result']['response'])
+    print("\nDeepSeek R1 Evaluation:")
+    print(results['deepseek_result']['evaluation'])
