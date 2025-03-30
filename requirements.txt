@@ -1,0 +1,4 @@
+Langchain
+Langgraph
+weaviate
+bs4

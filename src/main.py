@@ -23,9 +23,15 @@ from langgraph.prebuilt import ToolExecutor, ToolInvocation
 # os.environ["OPENAI_API_KEY"] = "your-openai-api-key"
 # os.environ["DEEPSEEK_API_KEY"] = "your-deepseek-api-key"
 
+from react_style import create_react_agent
 
-# Create a judge for evaluation (using GPT-4o)
-judge_llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# manager agent
+openai_o1 = ChatOpenAI(
+    model="gpt-4o-2024-05",  # Replace with actual o1 model name when available
+    temperature=0,
+    model_kwargs={"high_compute": True}  # Placeholder for high compute setting
+)
 
 
 # Define Manager Agent prompt
@@ -42,6 +48,15 @@ Use the tools available to you and think step by step."""),
     MessagesPlaceholder(variable_name="messages"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
+
+tools = []
+
+manager_agent = create_react_agent(openai_o1, manager_agent_prompt, tools)
+
+
+# Create a judge for evaluation (using GPT-4o)
+judge_llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
 
 # Define evaluation prompt
 evaluation_prompt = ChatPromptTemplate.from_messages([
@@ -64,93 +79,6 @@ Please evaluate this response.
 """)
 ])
 
-# Function to create a ReAct-style agent
-def create_react_agent(llm, prompt):
-    def format_tool_to_tool_schema(tool):
-        return {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.args_schema.schema() if hasattr(tool, "args_schema") else {"type": "object", "properties": {}},
-            },
-        }
-
-    # Format the tools for the LLM
-    llm_with_tools = llm.bind_tools(tools, format_tool_to_tool_schema=format_tool_to_tool_schema)
-    
-    # Logic for handling the agent's decision making
-    def agent_step(state):
-        input_messages = state["messages"]
-        
-        # Get the most recent message
-        most_recent_message = input_messages[-1]
-        
-        # If it's already an AI message, we've completed a step
-        if isinstance(most_recent_message, AIMessage):
-            return {"messages": input_messages}
-        
-        # Initialize or get agent_scratchpad
-        agent_scratchpad = []
-        if "agent_scratchpad" in state:
-            agent_scratchpad = state["agent_scratchpad"]
-        
-        # Prompt the LLM
-        output = llm_with_tools.invoke({
-            "messages": input_messages,
-            "agent_scratchpad": agent_scratchpad,
-        })
-        
-        # Check if the LLM wants to use a tool
-        if "function_call" in output.additional_kwargs:
-            tool_call = output.additional_kwargs["function_call"]
-            
-            # Add the agent's thinking to scratchpad
-            agent_scratchpad.append(output)
-            
-            # Extract tool name and args
-            tool_name = tool_call["name"]
-            tool_input = json.loads(tool_call["arguments"])
-            
-            # Execute the tool
-            tool_result = tool_executor.invoke(
-                ToolInvocation(
-                    tool=tool_name,
-                    tool_input=tool_input,
-                )
-            )
-            
-            # Format the result and add to scratchpad
-            observation_msg = AIMessage(content=str(tool_result))
-            agent_scratchpad.append(observation_msg)
-            
-            # Return the updated state with agent_scratchpad
-            return {"messages": input_messages, "agent_scratchpad": agent_scratchpad}
-        else:
-            # Agent is done - return final answer message
-            return {"messages": input_messages + [output]}
-    
-    # Build the workflow graph
-    workflow = StateGraph(state_types={"messages": List, "agent_scratchpad": List})
-    
-    # Add the main agent node
-    workflow.add_node("agent", agent_step)
-    
-    # Define the entry and exit
-    workflow.set_entry_point("agent")
-    workflow.add_conditional_edges(
-        "agent",
-        lambda state: "agent" if "agent_scratchpad" in state else END,
-    )
-    
-    # Compile the workflow
-    return workflow.compile()
-
-# Create the agents
-search_agent = create_react_agent(openai_o1, search_agent_prompt)
-rag_agent_openai = create_react_agent(openai_o1, rag_agent_prompt)
-rag_agent_deepseek = create_react_agent(deepseek_r1, rag_agent_prompt)
-manager_agent = create_react_agent(openai_o1, manager_agent_prompt)
 
 def evaluate_response(query, response):
     """Evaluate a response using the judge LLM"""
@@ -162,7 +90,9 @@ def evaluate_response(query, response):
     )
     return evaluation.content
 
-# Main interaction function
+
+
+# Manager agent function
 def process_query(query, model="openai"):
     """Process a research query through the agent system"""
     # Start with the manager agent

@@ -20,71 +20,9 @@ from langchain_core.pydantic_v1 import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolExecutor, ToolInvocation
 
+from react_style import create_react_agent
+from DB import client
 
-
-client = weaviate.Client(
-    embedded_options=EmbeddedOptions(
-        persistence_data_path="./data",
-        additional_env_vars={
-            "ENABLE_MODULES": "text2vec-openai",
-        }
-    )
-)
-
-# Set up schema if it doesn't exist
-if not client.schema.exists("ResearchPaper"):
-    schema = {
-        "classes": [
-            {
-                "class": "ResearchPaper",
-                "description": "A research paper with embeddings",
-                "vectorizer": "text2vec-openai",
-                "properties": [
-                    {
-                        "name": "title",
-                        "description": "Title of the paper",
-                        "dataType": ["text"],
-                    },
-                    {
-                        "name": "abstract",
-                        "description": "Abstract of the paper",
-                        "dataType": ["text"],
-                    },
-                    {
-                        "name": "authors",
-                        "description": "Authors of the paper",
-                        "dataType": ["text[]"],
-                    },
-                    {
-                        "name": "paper_id",
-                        "description": "Unique identifier for the paper",
-                        "dataType": ["string"],
-                    },
-                    {
-                        "name": "url",
-                        "description": "URL to access the paper",
-                        "dataType": ["string"],
-                    },
-                    {
-                        "name": "published_date",
-                        "description": "Publication date",
-                        "dataType": ["date"],
-                    },
-                    {
-                        "name": "source",
-                        "description": "Source of the paper (Arxiv)",
-                        "dataType": ["string"],
-                    },
-                    {
-                        "name": "full_text",
-                        "description": "Full text of the paper if available",
-                        "dataType": ["text"],
-                    }
-                ],
-            }
-        ]
-    }
-    client.schema.create(schema)
 
 # Set up embeddings
 embeddings = OpenAIEmbeddings()
@@ -122,25 +60,6 @@ def query_documents(input_data: QueryDocumentsInput) -> List[Dict]:
 
 # Create tools
 tools = [
-   
-    Tool(
-        name="search_arxiv",
-        description="Search for research papers using Arxiv API",
-        func=search_arxiv,
-        args_schema=ArxivSearchInput
-    ),
-    Tool(
-        name="scrape_paper",
-        description="Scrape a research paper from a given URL",
-        func=scrape_paper,
-        args_schema=WebScrapeInput
-    ),
-    Tool(
-        name="store_document",
-        description="Store a document in the vector database",
-        func=store_document,
-        args_schema=StoreDocumentInput
-    ),
     Tool(
         name="query_documents",
         description="Query documents from the vector database",
@@ -149,7 +68,6 @@ tools = [
     )
 ]
 
-tool_executor = ToolExecutor(tools)
 
 
 
@@ -189,3 +107,7 @@ Use the tools available to you and think step by step."""),
     MessagesPlaceholder(variable_name="messages"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
+
+
+rag_agent_openai = create_react_agent(openai_o1, rag_agent_prompt,tools)
+rag_agent_deepseek = create_react_agent(deepseek_r1, rag_agent_prompt,tools)
