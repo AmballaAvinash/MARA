@@ -44,9 +44,19 @@ manager_agent_prompt = ChatPromptTemplate.from_messages([
 3. Coordinate their activities
 4. Synthesize their outputs into a final answer for the user
 
-Use the tools available to you and think step by step."""),
+Use the tools available to you and think step by step.  
+                  
+    You must provide your answer in JSON format with the following structure:
+    {{
+    "agent": "AGENT_NAME",
+    "reasoning": "Your step-by-step reasoning for selecting this agent",
+    "confidence": 0.95  // Value between 0.0 and 1.0 indicating your confidence in this decision
+    }}
+                  
+                  """),
     MessagesPlaceholder(variable_name="messages"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
+    
 ])
 
 tools = []
@@ -70,14 +80,14 @@ Score each response on a scale of 1-10 based on:
 5. Clarity: How clearly is the information presented?
 
 Provide your overall score and brief justification."""),
-    HumanMessage(content="""
-Question: {query}
+        HumanMessage(content="""
+            Question: {query}
 
-Response to evaluate: {response}
+            Response to evaluate: {response}
 
-Please evaluate this response.
-""")
-])
+            Please evaluate this response.
+            """)
+            ])
 
 
 def evaluate_response(query, response):
