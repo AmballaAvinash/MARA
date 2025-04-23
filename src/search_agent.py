@@ -1,38 +1,27 @@
-
 import os
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-import time
 import json
 import arxiv
 import requests
-import weaviate
-from weaviate.embedded import EmbeddedOptions
+from typing import List, Dict, Any, Optional
+from datetime import datetime
 from bs4 import BeautifulSoup
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_openai import ChatOpenAI
-from langchain_deepseek import ChatDeepSeek
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain.tools.render import render_text_description
 from langchain_core.tools import Tool
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolExecutor, ToolInvocation
-
-from react_style import create_react_agent
-from DB import client
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_react_agent
+# Import database client
+from db import client
 
 # Define Arxiv API tool
 class ArxivSearchInput(BaseModel):
     query: str = Field(description="Search query for Arxiv")
     limit: int = Field(default=5, description="Maximum number of papers to retrieve")
 
-def search_arxiv(input_data: ArxivSearchInput) -> List[Dict]:
+def search_arxiv(query: str) -> List[Dict]:
     """Search for papers using the Arxiv API"""
-    query = input_data.query
-    limit = input_data.limit
+    limit = 5
     
     search = arxiv.Search(
         query=query,
@@ -55,15 +44,12 @@ def search_arxiv(input_data: ArxivSearchInput) -> List[Dict]:
     
     return papers
 
-
-
 # Define web scraping tool for custom sites
 class WebScrapeInput(BaseModel):
     url: str = Field(description="URL of the research paper to scrape")
 
-def scrape_paper(input_data: WebScrapeInput) -> Dict:
+def scrape_paper(url: str) -> Dict:
     """Scrape a research paper from a given URL"""
-    url = input_data.url
     
     response = requests.get(url)
     if response.status_code != 200:
@@ -90,17 +76,38 @@ def scrape_paper(input_data: WebScrapeInput) -> Dict:
         "source": "Web Scrape"
     }
 
+# Define tool to check if document exists
+class CheckDocumentInput(BaseModel):
+    paper_id: str = Field(description="Unique identifier for the paper")
 
+def check_document_exists(paper_id: int) -> Dict:
+    """Check if a document already exists in Weaviate"""
+    
+    result = (
+        client.query
+        .get("ResearchPaper", ["paper_id"])
+        .with_where({
+            "path": ["paper_id"],
+            "operator": "Equal",
+            "valueString": paper_id
+        })
+        .do()
+    )
+    
+    exists = len(result["data"]["Get"]["ResearchPaper"]) > 0
+    return {"exists": exists, "paper_id": paper_id}
 
 # Define database interaction tools
+
+# need to store the embedding properly
 class StoreDocumentInput(BaseModel):
     title: str = Field(description="Title of the paper")
-    abstract: str = Field(description="Abstract of the paper")
-    authors: List[str] = Field(description="Authors of the paper")
-    paper_id: str = Field(description="Unique identifier for the paper")
-    url: str = Field(description="URL to access the paper")
-    published_date: str = Field(description="Publication date (YYYY-MM-DD)")
-    source: str = Field(description="Source of the paper")
+    abstract: Optional[str] = Field( default="", description="Abstract of the paper")
+    authors: Optional[List[str]]  = Field( default=[""], description="Authors of the paper")
+    paper_id: Optional[str] = Field( default="", description="Unique identifier for the paper")
+    url: Optional[str] = Field( default="", description="URL to access the paper")
+    published_date: Optional[str] = Field( default="", description="Publication date (YYYY-MM-DD)")
+    source: Optional[str] = Field( default="", description="Source of the paper")
     full_text: Optional[str] = Field(default="", description="Full text of the paper if available")
 
 def store_document(input_data: StoreDocumentInput) -> Dict:
@@ -116,36 +123,23 @@ def store_document(input_data: StoreDocumentInput) -> Dict:
         "full_text": input_data.full_text
     }
     
-    # Check if document with same paper_id already exists
-    result = (
-        client.query
-        .get("ResearchPaper", ["paper_id"])
-        .with_where({
-            "path": ["paper_id"],
-            "operator": "Equal",
-            "valueString": input_data.paper_id
-        })
-        .do()
-    )
-    
-    if result["data"]["Get"]["ResearchPaper"]:
+    # Check if document already exists
+    check_result = check_document_exists(CheckDocumentInput(paper_id=input_data.paper_id))
+    if check_result["exists"]:
         return {"status": "Document already exists", "paper_id": input_data.paper_id}
     
     try:
         client.data_object.create(
             properties,
             "ResearchPaper",
-            vector_config={"vectorizer": "text2vec-openai"}  # Explicitly specify vectorizer
-
+            vector_config={"vectorizer": "text2vec-openai"}
         )
         return {"status": "success", "message": f"Stored {input_data.title} in the database"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-    
 
-# Create tools
-tools = [
-   
+# Create search tools list
+search_tools = [
     Tool(
         name="search_arxiv",
         description="Search for research papers using Arxiv API",
@@ -159,6 +153,12 @@ tools = [
         args_schema=WebScrapeInput
     ),
     Tool(
+        name="check_document_exists",
+        description="Check if a document exists in the database",
+        func=check_document_exists,
+        args_schema=CheckDocumentInput
+    ),
+    Tool(
         name="store_document",
         description="Store a document in the vector database",
         func=store_document,
@@ -166,35 +166,82 @@ tools = [
     ),
 ]
 
-tool_executor = ToolExecutor(tools)
-
-
-openai_o1 = ChatOpenAI(
-    model="gpt-4o-2024-05",  # Replace with actual o1 model name when available
-    temperature=0,
-    model_kwargs={"high_compute": True}  # Placeholder for high compute setting
-)
-
-
 # Define Search Agent prompt
-search_agent_prompt = ChatPromptTemplate.from_messages([
-    SystemMessage(content="""You are a Research Search Agent. Your job is to find relevant research papers based on the user's query.
+# search_agent_prompt = ChatPromptTemplate.from_messages([
+#     SystemMessage(content="""You are a Research Search Agent. Your job is to find relevant research papers based on the user's query.
     
-If the query can be answered by papers in our database, use those. If not, search external sources like Arxiv.
-Process each found paper and store it with proper embeddings in our database.
+# Follow these steps:
+# 1. Analyze the query to understand what research papers are needed
+# 2. Search external sources like Arxiv for relevant papers using the search_arxiv tool
+# 3. For each found paper, check if it exists in our database using check_document_exists
+# 4. If not, store it in the database using store_document
+# 5. Return a summary of what you found and stored
+
+# Think step by step and be thorough in your search. Your goal is to build a comprehensive database
+# of papers related to the query.
+# """),
+#     MessagesPlaceholder(variable_name="messages"),
+#     MessagesPlaceholder(variable_name="agent_scratchpad"),
+# ])
+
+
+search_agent_prompt = PromptTemplate.from_template(
+    """You are a Research Search Agent. Your job is to find relevant research papers based on the user's query.
 
 Follow these steps:
-1. Analyze the query to understand what research papers are needed
-2. Check if papers in our database can answer the query
-3. If not, search external sources for relevant papers
-4. Process and store new papers in the database
-5. Return a summary of what you found
+1. Analyze the query {input} to understand what research papers are needed
+2. Search external sources like Arxiv for relevant papers using the search_arxiv tool
+3. For each found paper, check if it exists in our database using check_document_exists
+4. If not, store it in the database using store_document. When using store_documents query you should provide
+       "title": The title of the paper,
+        "abstract": The abstract of the paper,
+        "authors": The authors of the paper,
+        "paper_id": The paper id of the paper
+        "url": The url of the paper
+        "published_date": The published date of the paper,
+        "source": The source of the paper
+        "full_text": The full text of the paper
 
-Use the tools available to you and think step by step."""),
-    MessagesPlaceholder(variable_name="messages"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
+5. Return a summary of what you found and stored
 
+You have access to the following tools: {tools}
 
-# Create the agents
-search_agent = create_react_agent(openai_o1, search_agent_prompt, tools)
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original question
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}"""
+)
+
+def create_search_agent(model="gpt-4o"):
+    """Create and return the search agent with appropriate LLM"""
+
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0
+    )
+    
+    # Create the agent using the langgraph prebuilt create_react_agent
+    agent = create_react_agent(llm, search_tools, prompt=search_agent_prompt)
+
+    # Create with proper configuration
+    return AgentExecutor(
+        agent=agent,
+        tools=search_tools,
+        handle_parsing_errors=True,
+        max_iterations=5,  # Prevent infinite loops
+        verbose=True  # For debugging
+    )
+
+# Default search agent using GPT-4o
+search_agent = create_search_agent()

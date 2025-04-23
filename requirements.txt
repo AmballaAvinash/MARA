@@ -1,4 +1,10 @@
-Langchain
-Langgraph
-weaviate
-bs4
+langchain-core>=0.1.7
+langchain-openai>=0.0.2
+langchain-deepseek>=0.0.1
+langchain-community>=0.0.13
+langgraph>=0.0.20
+weaviate-client==3.26.7
+beautifulsoup4>=4.12.2
+arxiv>=1.4.8
+requests>=2.31.0
+python-dotenv>=1.0.0
