@@ -13,8 +13,7 @@ from evaluation import evaluate_response, compare_evaluations
 
 # Configure environment variables
 # Uncomment and set these in production
-os.environ["OPENAI_API_KEY"] = "REMOVED"
-os.environ["DEEPSEEK_API_KEY"] = "REMOVED"
+
 
 def extract_agent_decision(manager_output: str) -> str:
     """Extract the agent decision from the manager output"""
